@@ -1,0 +1,70 @@
+---
+on: push
+
+# TODO get KERNEL_MAJOR_VERSION and KERNEL_MINOR_VERSION from gentoo-sources slot
+env:
+  CPUS: 4
+  CONTAINER_NAME: fbe
+  KERNEL_CONFIG_DIR: /etc/kernel/config.d
+  KERNEL_MAJOR_VERSION: 6
+  KERNEL_MINOR_VERSION: 6
+
+jobs:
+  build:
+    name: Build Kernel for RaspberryPI 4
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Create FBE Container
+        run: |
+          docker create \
+          --name ${{ env.CONTAINER_NAME }} \
+          --platform linux/arm64 \
+          --privileged \
+          --rm \
+          --volume $(pwd):/${{ github.workspace }} \
+          --workdir ${{ github.workspace }} \
+          docker.io/expeditioneer/fbe \
+          tail --follow /dev/null
+
+      - name: Start FBE Container
+        run: |
+          docker start ${{ env.CONTAINER_NAME }}
+
+      - name: Emerge Gentoo kernel sources
+        run: |
+          docker exec ${{ env.CONTAINER_NAME }} sh -c ' \
+          MAKEOPTS="--jobs ${{ env.CPUS }}" \
+          FEATURES="protect-owned -collision-protect -ipc-sandbox -network-sandbox -pid-sandbox" USE="symlink" \
+          emerge gentoo-sources'
+
+      - name: Copy Kernel configuration snippets
+        run: |
+          docker exec ${{ env.CONTAINER_NAME }} sh -c 'mkdir --parents ${{ env.KERNEL_CONFIG_DIR }}'
+          docker exec ${{ env.CONTAINER_NAME }} sh -c 'mkdir --parents /usr/src/linux/arch/arm64/configs'
+          docker exec ${{ env.CONTAINER_NAME }} sh -c 'curl --silent --show-error --location --output /usr/src/linux/arch/arm64/configs/bcm2711_defconfig \
+            "https://github.com/raspberrypi/linux/raw/rpi-${{ env.KERNEL_MAJOR_VERSION }}.${{ env.KERNEL_MINOR_VERSION }}.y/arch/arm64/configs/bcm2711_defconfig"'
+          docker cp kernel/config.d ${{ env.CONTAINER_NAME }}:/etc/kernel/
+
+      - name: Create Kernel configuration
+        run: |
+          docker exec --workdir /usr/src/linux  ${{ env.CONTAINER_NAME }} sh -c 'make bcm2711_defconfig'
+          docker exec --workdir /usr/src/linux ${{ env.CONTAINER_NAME }} sh -c ' \
+          shopt -s nullglob && \
+          config_snippets=( ${{ env.KERNEL_CONFIG_DIR }}/*.config ) && \
+          shopt -u nullglob && \
+          ./scripts/kconfig/merge_config.sh -m -r .config "${config_snippets[@]}" && \
+          echo "Printing Kernel configuration:" && \
+          cat .config'
+          
+
+      - name: Compile Kernel
+        run: |
+          docker exec --workdir /usr/src/linux ${{ env.CONTAINER_NAME }} sh -c ' \
+          make -j${{ env.CPUS }} CFLAGS="-mcpu=cortex-a72 -ftree-vectorize -O2 -pipe -fomit-frame-pointer"'
