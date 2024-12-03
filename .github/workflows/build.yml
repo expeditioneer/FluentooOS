@@ -1,7 +1,6 @@
 ---
 on: push
 
-# TODO get KERNEL_MAJOR_VERSION and KERNEL_MINOR_VERSION from gentoo-sources slot
 env:
   CONTAINER_NAME: fbe
   KERNEL_CONFIG_DIR: /etc/kernel/config.d
@@ -22,7 +21,7 @@ jobs:
         run: |
           echo "CPUS=$(nproc --all)" >> ${GITHUB_ENV}
 
-      - name: Create FBE Container
+      - name: Create ${{ env.CONTAINER_NAME }} Container
         run: |
           docker create \
           --name ${{ env.CONTAINER_NAME }} \
@@ -38,38 +37,43 @@ jobs:
         run: |
           docker start ${{ env.CONTAINER_NAME }}
 
-      - name: Emerge Gentoo kernel sources
+      - name: Determine Kernel Version and set major, minor and hotfix kernel version environment variable
         run: |
-          docker exec ${{ env.CONTAINER_NAME }} sh -c ' \
-          MAKEOPTS="--jobs ${{ env.CPUS }}" \
-          FEATURES="protect-owned -collision-protect -ipc-sandbox -network-sandbox -pid-sandbox" USE="symlink" \
-          emerge sys-kernel/gentoo-sources'
-
-      - name: Set major and minor kernel version environment variable
-        run: |
-          IFS='.' read -r -a kernel_version <<< $(equery list sys-kernel/gentoo-kernel --format '$fullversion')
+          kernel_version=($(docker exec ${{ env.CONTAINER_NAME }} sh -c "basename \$(equery which sys-kernel/gentoo-kernel) | sed -e 's/gentoo-kernel-//g' | sed -e 's/.ebuild//g' | tr '.' '\n'"))
           echo "KERNEL_MAJOR_VERSION=${kernel_version[0]}" >> ${GITHUB_ENV}
           echo "KERNEL_MINOR_VERSION=${kernel_version[1]}" >> ${GITHUB_ENV}
+          echo "KERNEL_HOTFIX_VERSION=${kernel_version[2]}" >> ${GITHUB_ENV}          
 
-      - name: Copy Kernel configuration snippets
+      # WORKAROUND: see https://github.com/pkgcore/pkgcore/issues/303
+      - name: 'Workaround for: "error: repos.conf: default repo "gentoo" is undefined or invalid"'
+        run: |
+          echo "WORKAROUND: see https://github.com/pkgcore/pkgcore/issues/303"    
+          docker exec ${{ env.CONTAINER_NAME }} sh -c 'mkdir --parents /etc/portage/repos.conf'
+          docker exec ${{ env.CONTAINER_NAME }} sh -c 'cp /usr/share/portage/config/repos.conf /etc/portage/repos.conf/gentoo.conf'
+
+      - name: Create local overlay and necessary directory structure for FluentooOS-kernel ebuild
+        run: |
+          docker exec ${{ env.CONTAINER_NAME }} sh -c 'eselect repository create local'
+          docker exec --workdir /var/db/repos/local ${{ env.CONTAINER_NAME }} sh -c 'mkdir --parents sys-kernel/fluentoo-kernel-bin'  
+          docker exec --workdir /var/db/repos/local/sys-kernel/fluentoo-kernel-bin ${{ env.CONTAINER_NAME }} sh -c 'mkdir --parents files'
+
+      - name: Create FluentooOS-kernel ebuild
+        run: |
+          docker cp ebuild/fluentoo-kernel-bin.ebuild.j2 ${{ env.CONTAINER_NAME }}://var/db/repos/local/sys-kernel/fluentoo-kernel-bin/fluentoo-kernel-bin-${{ env.KERNEL_MAJOR_VERSION }}.${{ env.KERNEL_MINOR_VERSION }}.${{ env.KERNEL_HOTFIX_VERSION }}.ebuild
+          docker exec --workdir /var/db/repos/local/sys-kernel/fluentoo-kernel-bin/files ${{ env.CONTAINER_NAME }} sh -c 'curl --silent --show-error --location --remote-name \
+                      "https://github.com/raspberrypi/linux/raw/rpi-${{ env.KERNEL_MAJOR_VERSION }}.${{ env.KERNEL_MINOR_VERSION }}.y/arch/arm64/configs/bcm2711_defconfig"'
+          docker exec --workdir /var/db/repos/local/sys-kernel/fluentoo-kernel-bin ${{ env.CONTAINER_NAME }} sh -c 'pkgdev manifest'
+          docker exec --workdir /var/db/repos/local/sys-kernel/fluentoo-kernel-bin ${{ env.CONTAINER_NAME }} sh -c 'pkgcheck scan'
+
+      - name: Copy Kernel configuration customization snippets
         run: |
           docker exec ${{ env.CONTAINER_NAME }} sh -c 'mkdir --parents ${{ env.KERNEL_CONFIG_DIR }}'
-          docker exec ${{ env.CONTAINER_NAME }} sh -c 'mkdir --parents /usr/src/linux/arch/arm64/configs'
-          docker exec ${{ env.CONTAINER_NAME }} sh -c 'curl --silent --show-error --location --output /usr/src/linux/arch/arm64/configs/bcm2711_defconfig \
-            "https://github.com/raspberrypi/linux/raw/rpi-${{ env.KERNEL_MAJOR_VERSION }}.${{ env.KERNEL_MINOR_VERSION }}.y/arch/arm64/configs/bcm2711_defconfig"'
           docker cp kernel/config.d ${{ env.CONTAINER_NAME }}:/etc/kernel/
 
-      - name: Create Kernel configuration
+      # TODO: add buildbinpkg
+      - name: Compile Fluentoo Kernel
         run: |
-          docker exec --workdir /usr/src/linux  ${{ env.CONTAINER_NAME }} sh -c 'make bcm2711_defconfig'
-          docker exec --workdir /usr/src/linux ${{ env.CONTAINER_NAME }} sh -c ' \
-          shopt -s nullglob && \
-          config_snippets=( ${{ env.KERNEL_CONFIG_DIR }}/*.config ) && \
-          shopt -u nullglob && \
-          ./scripts/kconfig/merge_config.sh -m -r .config "${config_snippets[@]}"'
-          
+          docker exec ${{ env.CONTAINER_NAME }} sh -c 'emerge fluentoo-kernel-bin'
+          docker exec ${{ env.CONTAINER_NAME }} sh -c 'ls -lR /var/tmp/portage/sys-kernel/gentoo-kernel-${{ env.KERNEL_MAJOR_VERSION }}.${{ env.KERNEL_MINOR_VERSION }}.${{ env.KERNEL_HOTFIX_VERSION }}/ '
 
-      - name: Compile Kernel
-        run: |
-          docker exec --workdir /usr/src/linux ${{ env.CONTAINER_NAME }} sh -c ' \
-          make -j${{ env.CPUS }} CFLAGS="-mcpu=cortex-a72 -ftree-vectorize -O2 -pipe -fomit-frame-pointer"'
+      # TODO: create release with attached binpkg
