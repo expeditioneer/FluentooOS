@@ -42,14 +42,14 @@ jobs:
         run: |
           docker exec ${{ env.CONTAINER_NAME }} sh -c ' \
           MAKEOPTS="--jobs ${{ env.CPUS }}" \
-          FEATURES="protect-owned -collision-protect -ipc-sandbox -network-sandbox -pid-sandbox" USE="symlink" \
-          emerge sys-kernel/gentoo-sources'
+          USE="symlink" emerge_wrapper sys-kernel/gentoo-sources'
 
       - name: Set major and minor kernel version environment variable
         run: |
-          IFS='.' read -r -a kernel_version <<< $(equery list sys-kernel/gentoo-kernel --format '$fullversion')
-          echo "KERNEL_MAJOR_VERSION=${kernel_version[0]}" >> ${GITHUB_ENV}
-          echo "KERNEL_MINOR_VERSION=${kernel_version[1]}" >> ${GITHUB_ENV}
+          docker exec ${{ env.CONTAINER_NAME }} sh -c "
+          IFS='.' read -r -a kernel_version <<< $(equery list sys-kernel/gentoo-kernel --format '$fullversion') && \
+          echo "KERNEL_MAJOR_VERSION=${kernel_version[0]}" >> ${GITHUB_ENV}  && \
+          echo "KERNEL_MINOR_VERSION=${kernel_version[1]}" >> ${GITHUB_ENV}"
 
       - name: Copy Kernel configuration snippets
         run: |
