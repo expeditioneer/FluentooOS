@@ -42,23 +42,26 @@ jobs:
         run: |
           docker exec ${{ env.CONTAINER_NAME }} sh -c ' \
           MAKEOPTS="--jobs ${{ env.CPUS }}" \
-          FEATURES="protect-owned -collision-protect -ipc-sandbox -network-sandbox -pid-sandbox" USE="symlink" \
-          emerge sys-kernel/gentoo-sources'
+          USE="symlink" emerge_wrapper --oneshot sys-kernel/gentoo-sources'
 
       - name: Set major and minor kernel version environment variable
         run: |
-          IFS='.' read -r -a kernel_version <<< $(equery list sys-kernel/gentoo-kernel --format '$fullversion')
+          kernel_version=($(docker exec ${{ env.CONTAINER_NAME }} sh -c "equery list sys-kernel/gentoo-sources --format '\$fullversion' | tr '.' '\n'"))
           echo "KERNEL_MAJOR_VERSION=${kernel_version[0]}" >> ${GITHUB_ENV}
           echo "KERNEL_MINOR_VERSION=${kernel_version[1]}" >> ${GITHUB_ENV}
+          echo "KERNEL_HOTFIX_VERSION=${kernel_version[2]}" >> ${GITHUB_ENV}
 
-      - name: Copy Kernel configuration snippets
+      - name: Copy Kernel configuration customization snippets
         run: |
           docker exec ${{ env.CONTAINER_NAME }} sh -c 'mkdir --parents ${{ env.KERNEL_CONFIG_DIR }}'
+          docker cp kernel/config.d ${{ env.CONTAINER_NAME }}:/etc/kernel/
+          
+          # TODO: should not be more necessary
           docker exec ${{ env.CONTAINER_NAME }} sh -c 'mkdir --parents /usr/src/linux/arch/arm64/configs'
           docker exec ${{ env.CONTAINER_NAME }} sh -c 'curl --silent --show-error --location --output /usr/src/linux/arch/arm64/configs/bcm2711_defconfig \
             "https://github.com/raspberrypi/linux/raw/rpi-${{ env.KERNEL_MAJOR_VERSION }}.${{ env.KERNEL_MINOR_VERSION }}.y/arch/arm64/configs/bcm2711_defconfig"'
-          docker cp kernel/config.d ${{ env.CONTAINER_NAME }}:/etc/kernel/
 
+      # TODO: step sould be no longer necessary, since it is covered by ebuild
       - name: Create Kernel configuration
         run: |
           docker exec --workdir /usr/src/linux  ${{ env.CONTAINER_NAME }} sh -c 'make bcm2711_defconfig'
@@ -67,9 +70,32 @@ jobs:
           config_snippets=( ${{ env.KERNEL_CONFIG_DIR }}/*.config ) && \
           shopt -u nullglob && \
           ./scripts/kconfig/merge_config.sh -m -r .config "${config_snippets[@]}"'
-          
 
-      - name: Compile Kernel
+      # TODO: not sure if jq and jinja is actually needed
+      - name: Create FluentooOS-kernel ebuild
+        run: |
+          docker cp ebuild/fluentoo-kernel-bin.ebuild.j2 ${{ env.CONTAINER_NAME }}:/tmp/fluentoo-kernel-bin.ebuild.j2
+          
+          docker exec ${{ env.CONTAINER_NAME }} sh -c ' \
+          eselect repository create local && \
+          jq --null-input --arg year "$(date +%Y)" '{year: $year}' > /tmp/config.json'
+          
+          docker exec --workdir /var/db/repos/local ${{ env.CONTAINER_NAME }} sh -c ' \
+          mkdir --parents sys-kernel/fluentoo-kernel-bin'
+          
+          docker exec --workdir /var/db/repos/local/sys-kernel/fluentoo-kernel-bin ${{ env.CONTAINER_NAME }} sh -c ' \
+          mkdir --parents files'
+          
+          docker exec --workdir /var/db/repos/local/sys-kernel/fluentoo-kernel-bin/files ${{ env.CONTAINER_NAME }} sh -c 'curl --silent --show-error --location --remote-name \
+                      "https://github.com/raspberrypi/linux/raw/rpi-${{ env.KERNEL_MAJOR_VERSION }}.${{ env.KERNEL_MINOR_VERSION }}.y/arch/arm64/configs/bcm2711_defconfig"'
+          
+          docker exec --workdir /var/db/repos/local/sys-kernel/fluentoo-kernel ${{ env.CONTAINER_NAME }} sh -c ' \
+          jinja --data config.json /tmp/fluentoo-kernel-bin.ebuild.j2 --output fluentoo-kernel-bin-${{ env.KERNEL_MAJOR_VERSION }}.${{ env.KERNEL_MINOR_VERSION }}.${{ env.KERNEL_HOTFIX_VERSION }}.ebuild && \      
+          pkgdev manifest && \
+          pkgcheck scan'
+
+      # TODO: replace with emerge/buildbinpkg fluentoo-kernel-bin
+      - name: Compile Fluentoo Kernel
         run: |
           docker exec --workdir /usr/src/linux ${{ env.CONTAINER_NAME }} sh -c ' \
           make -j${{ env.CPUS }} CFLAGS="-mcpu=cortex-a72 -ftree-vectorize -O2 -pipe -fomit-frame-pointer"'
